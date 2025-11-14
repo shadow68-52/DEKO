@@ -23,7 +23,7 @@ const commands = [
         { name: 'Повышение', value: 'promote' },
         { name: 'Понижение', value: 'demote' },
         { name: 'Выговор', value: 'warn' },
-        { name: 'Увольнение (kick)', value: 'fire' },
+        { name: 'Увольнение', value: 'fire' },
         { name: 'Выдача ранга', value: 'give_rank' }
       ))
     .addStringOption(o => o.setName('from_rank').setDescription('С какого ранга').setRequired(false))
@@ -35,8 +35,7 @@ const commands = [
     .setDescription('Добавить статик/пользователя в ЧС')
     .addStringOption(o => o.setName('static').setDescription('Статик / имя').setRequired(true))
     .addStringOption(o => o.setName('reason').setDescription('Причина').setRequired(true))
-    .addStringOption(o => o.setName('duration').setDescription('Срок (30d/permanent)').setRequired(false))
-    .addUserOption(o => o.setName('target').setDescription('Упомянуть пользователя').setRequired(false)),
+    .addStringOption(o => o.setName('duration').setDescription('Срок (30d/permanent)').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('blacklist-list')
@@ -45,7 +44,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('blacklist-remove')
     .setDescription('Удалить запись из ЧС')
-    .addStringOption(o => o.setName('id').setDescription('ID записи').setRequired(true))
+    .addStringOption(o => o.setName('static').setDescription('Статик / имя').setRequired(true))
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
