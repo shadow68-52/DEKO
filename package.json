@@ -1,0 +1,22 @@
+{
+  "name": "versize-bot-clean",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "register": "node register-commands.js",
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@discordjs/rest": "^2.3.0",
+    "discord-api-types": "^0.37.61",
+    "discord.js": "^14.15.2",
+    "express": "^4.18.2",
+    "cookie-parser": "^1.4.6",
+    "express-session": "^1.17.3",
+    "dotenv": "^16.4.5"
+  }
+}
