@@ -41,6 +41,7 @@ const {
   ALLOWED_ROLES,
   OAUTH_REDIRECT_URI,
   SESSION_SECRET,
+  ACCEPT_ROLE_ID, // добавлено — роль, выдаваемая при принятии заявки (опционально)
   PORT = 3000
 } = process.env;
 
@@ -74,6 +75,41 @@ function saveBlacklist(data) {
   }
 }
 let BLACKLIST = loadBlacklist(); // { items: [ { id: 'IC#1234', reason:'', addedBy:'', until: timestamp|null, createdAt } ] }
+
+// ----------------------------- BLACKLIST EXPIRY CHECK (auto) -----------------------------
+const BLACKLIST_EXPIRY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // каждые 5 минут
+
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const expired = BLACKLIST.items.filter(item => item.until && item.until <= now);
+    if (expired.length === 0) return;
+
+    // Удаляем просроченные записи
+    BLACKLIST.items = BLACKLIST.items.filter(item => !item.until || item.until > now);
+    saveBlacklist(BLACKLIST);
+
+    // Уведомление в канал ЧС (если задан)
+    if (BLACKLIST_CHANNEL_ID) {
+      (async () => {
+        try {
+          const ch = await client.channels.fetch(BLACKLIST_CHANNEL_ID).catch(()=>null);
+          if (ch && ch.isTextBased()) {
+            for (const it of expired) {
+              await ch.send(`♻️ Срок ЧС истёк: **${it.id}** — причина: ${it.reason || '—'} (добавил: ${it.addedBy || '—'})`).catch(()=>{});
+            }
+          }
+        } catch (e) {
+          console.warn('Blacklist expiry notify failed', e?.message || e);
+        }
+      })();
+    }
+
+    console.log(`Blacklist: removed ${expired.length} expired items.`);
+  } catch (e) {
+    console.error('Blacklist expiry check error', e);
+  }
+}, BLACKLIST_EXPIRY_CHECK_INTERVAL_MS);
 
 // ----------------------------- DISCORD CLIENT -----------------------------
 const client = new Client({
@@ -420,6 +456,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setTimestamp();
 
         await thread.send({ embeds: [embed] }).catch(()=>{});
+
+        // --- Авто-выдача роли заявителю (если задано)
+        if (ACCEPT_ROLE_ID) {
+          try {
+            // thread.ownerId содержит id автора треда при создании через форум
+            const applicantId = thread.ownerId || null;
+            if (applicantId && thread.guild) {
+              // fetch guild and member to ensure up-to-date info
+              const guild = await thread.guild.fetch().catch(()=>null);
+              const member = guild ? await guild.members.fetch(applicantId).catch(()=>null) : null;
+              if (member) {
+                await member.roles.add(ACCEPT_ROLE_ID).catch(e => {
+                  console.warn('Grant role failed:', e?.message || e);
+                });
+              } else {
+                // если участник не в гильдии — ничего не делаем
+                console.log('Applicant not found in guild to grant role:', applicantId);
+              }
+            } else {
+              // если нет ownerId (например, создано не форумом) — можно дополнительно попытаться найти автора по последнему сообщению
+              try {
+                const fetched = await thread.fetch();
+                const lastMsg = fetched?.messages?.cache?.first();
+                const possibleAuthor = lastMsg?.author?.id;
+                if (possibleAuthor && thread.guild) {
+                  const guild2 = await thread.guild.fetch().catch(()=>null);
+                  const member2 = guild2 ? await guild2.members.fetch(possibleAuthor).catch(()=>null) : null;
+                  if (member2) {
+                    await member2.roles.add(ACCEPT_ROLE_ID).catch(e => {
+                      console.warn('Grant role failed (fallback):', e?.message || e);
+                    });
+                  }
+                }
+              } catch (e) {
+                // fallback failed - ignore
+              }
+            }
+          } catch (e) {
+            console.warn('Auto-grant role error:', e?.message || e);
+          }
+        }
+
         await thread.setArchived(true).catch(()=>{});
 
         // log
@@ -743,6 +821,21 @@ app.get('/api/thread/accept', requireAuth, async (req, res) => {
       const logCh = await client.channels.fetch(LEADERS_LOG_CHANNEL_ID).catch(()=>null);
       if (logCh && logCh.isTextBased()) logCh.send({ embeds: [new EmbedBuilder().setTitle('📗 Одобрение (WEB)').addFields({ name: 'Лидер', value: `<@${uid}>` }, { name: 'Thread', value: thread.name }).setColor(0x2ecc71)] }).catch(()=>{});
     }
+    // Auto-grant role for WEB accept (if configured)
+    if (ACCEPT_ROLE_ID) {
+      try {
+        const applicantId = thread.ownerId || null;
+        if (applicantId && thread.guild) {
+          const guild = await thread.guild.fetch().catch(()=>null);
+          const member = guild ? await guild.members.fetch(applicantId).catch(()=>null) : null;
+          if (member) {
+            await member.roles.add(ACCEPT_ROLE_ID).catch(e => { console.warn('Grant role failed (WEB):', e?.message || e); });
+          }
+        }
+      } catch (e) {
+        console.warn('Auto-grant role error (WEB):', e?.message || e);
+      }
+    }
     res.redirect('/panel/applications');
   } catch (e) {
     console.error('API accept error', e);
@@ -773,6 +866,67 @@ app.get('/api/thread/deny', requireAuth, async (req, res) => {
   } catch (e) {
     console.error('API deny error', e);
     res.send('Ошибка');
+  }
+});
+
+// ----------------------------- WEBHOOK: forms / zapier -> create application -----------------------------
+app.post('/webhook/form', async (req, res) => {
+  try {
+    // ожидаем body: { name, discord, ic, motivation, type } type: family|restore|unblack (опционально)
+    const { name, discord, ic, motivation, type = 'family' } = req.body || {};
+
+    // простая валидация
+    if (!name || !discord || !ic || !motivation) {
+      return res.status(400).json({ error: 'Missing fields. Required: name, discord, ic, motivation' });
+    }
+
+    if (!APP_CHANNEL_ID) {
+      return res.status(500).json({ error: 'APP_CHANNEL_ID not configured' });
+    }
+
+    const forum = await client.channels.fetch(APP_CHANNEL_ID).catch(()=>null);
+    if (!forum) return res.status(500).json({ error: 'Application channel not found' });
+
+    const embed = new EmbedBuilder()
+      .setTitle(type === 'family' ? '📩 Заявка на вступление (WEBHOOK)' : type === 'restore' ? '📩 Восстановление (WEBHOOK)' : '📩 Снятие ЧС (WEBHOOK)')
+      .setColor(0x7b68ee)
+      .addFields(
+        { name: 'Имя (OOC)', value: name },
+        { name: 'Discord', value: discord },
+        { name: 'IC данные', value: ic },
+        { name: 'Мотивация', value: motivation }
+      )
+      .setFooter({ text: 'Заявка из WEBHOOK' })
+      .setTimestamp();
+
+    const msgPayload = {
+      content: ALLOWED_ROLE_IDS.length ? ALLOWED_ROLE_IDS.map(r => `<@&${r}>`).join(' ') : '',
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`accept_webhook_${Date.now()}`).setLabel('Принять').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`deny_webhook_${Date.now()}`).setLabel('Отклонить').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    };
+
+    // forum or text channel handling
+    if (forum.type === ChannelType.GuildForum) {
+      const thread = await forum.threads.create({
+        name: `Заявка — ${name}`,
+        message: msgPayload
+      }).catch(e => { throw e; });
+      res.json({ ok: true, threadId: thread.id });
+      return;
+    } else {
+      const sent = await forum.send(msgPayload).catch(e => { throw e; });
+      if (sent?.startThread) await sent.startThread({ name: `Заявка — ${name}` }).catch(()=>null);
+      res.json({ ok: true });
+      return;
+    }
+  } catch (e) {
+    console.error('Webhook create application failed', e);
+    res.status(500).json({ error: e?.message || 'internal error' });
   }
 });
 
