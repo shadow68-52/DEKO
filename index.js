@@ -41,7 +41,7 @@ const {
   ALLOWED_ROLES,
   OAUTH_REDIRECT_URI,
   SESSION_SECRET,
-  ACCEPT_ROLE_ID, // добавлено — роль, выдаваемая при принятии заявки (опционально)
+  ACCEPT_ROLE_ID, // optional: role to grant on accept
   PORT = 3000
 } = process.env;
 
@@ -55,56 +55,86 @@ const ALLOWED_ROLE_IDS = (ALLOWED_ROLES || '').split(',').map(s => s.trim()).fil
 
 // ----------------------------- BLACKLIST STORAGE -----------------------------
 const BLACKLIST_FILE = path.resolve('./blacklist.json');
-function loadBlacklist() {
-  try {
-    if (!fs.existsSync(BLACKLIST_FILE)) {
-      fs.writeFileSync(BLACKLIST_FILE, JSON.stringify({ items: [] }, null, 2));
-    }
-    const raw = fs.readFileSync(BLACKLIST_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (e) {
-    console.error('Failed to load blacklist.json', e);
-    return { items: [] };
-  }
-}
+
 function saveBlacklist(data) {
   try {
-    fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(data, null, 2));
+    if (!data || typeof data !== 'object') data = { items: [] };
+    if (!Array.isArray(data.items)) data.items = [];
+    fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(data, null, 2), 'utf8');
   } catch (e) {
     console.error('Failed to save blacklist.json', e);
   }
 }
-let BLACKLIST = loadBlacklist(); // { items: [ { id: 'IC#1234', reason:'', addedBy:'', until: timestamp|null, createdAt } ] }
 
-// ----------------------------- BLACKLIST EXPIRY CHECK (auto) -----------------------------
-const BLACKLIST_EXPIRY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // каждые 5 минут
-
-setInterval(() => {
+function loadBlacklist() {
   try {
-    const now = Date.now();
-    const expired = BLACKLIST.items.filter(item => item.until && item.until <= now);
-    if (expired.length === 0) return;
-
-    // Удаляем просроченные записи
-    BLACKLIST.items = BLACKLIST.items.filter(item => !item.until || item.until > now);
-    saveBlacklist(BLACKLIST);
-
-    // Уведомление в канал ЧС (если задан)
-    if (BLACKLIST_CHANNEL_ID) {
-      (async () => {
-        try {
-          const ch = await client.channels.fetch(BLACKLIST_CHANNEL_ID).catch(()=>null);
-          if (ch && ch.isTextBased()) {
-            for (const it of expired) {
-              await ch.send(`♻️ Срок ЧС истёк: **${it.id}** — причина: ${it.reason || '—'} (добавил: ${it.addedBy || '—'})`).catch(()=>{});
-            }
-          }
-        } catch (e) {
-          console.warn('Blacklist expiry notify failed', e?.message || e);
-        }
-      })();
+    // create default if not exists
+    if (!fs.existsSync(BLACKLIST_FILE)) {
+      const def = { items: [] };
+      fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(def, null, 2), 'utf8');
+      return def;
     }
 
+    const raw = fs.readFileSync(BLACKLIST_FILE, 'utf8').trim();
+    if (!raw) {
+      const def = { items: [] };
+      fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(def, null, 2), 'utf8');
+      return def;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      const def = { items: [] };
+      saveBlacklist(def);
+      return def;
+    }
+    if (!Array.isArray(parsed.items)) {
+      parsed.items = Array.isArray(parsed?.items) ? parsed.items : [];
+      saveBlacklist(parsed);
+    }
+    return parsed;
+  } catch (e) {
+    console.error('Failed to load/parse blacklist.json, recreating default.', e);
+    try {
+      const def = { items: [] };
+      fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(def, null, 2), 'utf8');
+      return def;
+    } catch (ee) {
+      console.error('Failed to recreate blacklist.json', ee);
+      return { items: [] };
+    }
+  }
+}
+
+let BLACKLIST = loadBlacklist(); // { items: [...] }
+
+// ----------------------------- BLACKLIST EXPIRY CHECK (auto) -----------------------------
+const BLACKLIST_EXPIRY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+setInterval(async () => {
+  try {
+    if (!BLACKLIST || !Array.isArray(BLACKLIST.items)) {
+      BLACKLIST = loadBlacklist();
+    }
+    const now = Date.now();
+    const expired = (BLACKLIST.items || []).filter(item => item.until && item.until <= now);
+    if (!expired.length) return;
+
+    BLACKLIST.items = (BLACKLIST.items || []).filter(item => !item.until || item.until > now);
+    saveBlacklist(BLACKLIST);
+
+    if (BLACKLIST_CHANNEL_ID) {
+      try {
+        const ch = await client.channels.fetch(BLACKLIST_CHANNEL_ID).catch(()=>null);
+        if (ch && ch.isTextBased()) {
+          for (const it of expired) {
+            await ch.send(`♻️ Срок ЧС истёк: **${it.id}** — причина: ${it.reason || '—'} (добавил: ${it.addedBy || '—'})`).catch(()=>{});
+          }
+        }
+      } catch (e) {
+        console.warn('Blacklist expiry notify failed', e?.message || e);
+      }
+    }
     console.log(`Blacklist: removed ${expired.length} expired items.`);
   } catch (e) {
     console.error('Blacklist expiry check error', e);
@@ -124,12 +154,10 @@ const client = new Client({
 
 // ----------------------------- UTILS -----------------------------
 async function ensureThreadActive(thread) {
-  // thread may be a ThreadChannel or a MessageThread
   try {
     if (!thread) return;
     if (typeof thread.archived === 'boolean' && thread.archived) {
       await thread.setArchived(false, 'Auto-unarchive for bot action').catch(() => {});
-      // short delay to allow Discord to update
       await new Promise(r => setTimeout(r, 250));
     }
   } catch (e) {
@@ -138,8 +166,13 @@ async function ensureThreadActive(thread) {
 }
 
 function hasLeaderRole(member) {
-  if (!member || !member.roles) return false;
-  return ALLOWED_ROLE_IDS.some(r => member.roles.cache.has(r));
+  if (!member) return false;
+  try {
+    if (!member.roles) return false;
+    return ALLOWED_ROLE_IDS.some(r => member.roles.cache.has(r));
+  } catch (e) {
+    return false;
+  }
 }
 
 function formatDate(ts) {
@@ -170,7 +203,6 @@ const commands = [
     .addStringOption(o => o.setName('from_rank').setDescription('С какого ранга').setRequired(false))
     .addStringOption(o => o.setName('to_rank').setDescription('На какой ранг').setRequired(false)),
 
-  // Blacklist commands
   new SlashCommandBuilder()
     .setName('blacklist-add')
     .setDescription('Добавить статик в черный список')
@@ -219,9 +251,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // apply-panel
       if (cmd === 'apply-panel') {
-        // permission: only allowed roles can post panel (optional)
         if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild)) {
-          // You may change permission logic; for now require ManageGuild or allowed role
           const member = interaction.member;
           if (!hasLeaderRole(member)) {
             await interaction.reply({ content: 'У вас нет прав на публикацию панели.', ephemeral: true });
@@ -274,7 +304,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           )
           .setTimestamp();
 
-        // send to audit channel
         if (AUDIT_CHANNEL_ID) {
           try {
             const ch = await client.channels.fetch(AUDIT_CHANNEL_ID);
@@ -284,11 +313,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        // if action is 'fire' attempt to kick from guild
         if (action === 'fire' && GUILD_ID) {
           try {
             const guild = await client.guilds.fetch(GUILD_ID);
-            // kick member
             await guild.members.kick(target.id, reason).catch(e => {
               console.warn('Kick failed:', e?.message || e);
             });
@@ -303,7 +330,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // blacklist-add
       if (cmd === 'blacklist-add') {
-        // only allowed roles can run
         const member = interaction.member;
         if (!hasLeaderRole(member)) {
           await interaction.reply({ content: 'У вас нет прав для добавления в ЧС.', ephemeral: true });
@@ -312,9 +338,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const ic = interaction.options.getString('static', true).trim();
         const reason = interaction.options.getString('reason', true);
-        const duration = interaction.options.getString('duration') || 'permanent'; // can parse e.g. 7d
+        const duration = interaction.options.getString('duration') || 'permanent';
 
-        // compute until timestamp
         let until = null;
         if (duration !== 'permanent') {
           const m = duration.match(/^(\d+)(d|h)$/);
@@ -327,7 +352,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        // add to blacklist
+        // ensure structure exists
+        if (!BLACKLIST || typeof BLACKLIST !== 'object') BLACKLIST = { items: [] };
+        if (!Array.isArray(BLACKLIST.items)) BLACKLIST.items = [];
+
         BLACKLIST.items.push({
           id: ic,
           reason,
@@ -337,7 +365,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         saveBlacklist(BLACKLIST);
 
-        // post to blacklist channel
         const embed = new EmbedBuilder()
           .setTitle('⛔ Новый черный список — добавление')
           .addFields(
@@ -370,6 +397,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
         const ic = interaction.options.getString('static', true).trim();
+
+        if (!BLACKLIST || !Array.isArray(BLACKLIST.items)) BLACKLIST = { items: [] };
         const before = BLACKLIST.items.length;
         BLACKLIST.items = BLACKLIST.items.filter(it => it.id.toLowerCase() !== ic.toLowerCase());
         saveBlacklist(BLACKLIST);
@@ -396,7 +425,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // blacklist-list
       if (cmd === 'blacklist-list') {
-        const items = BLACKLIST.items;
+        const items = (BLACKLIST && Array.isArray(BLACKLIST.items)) ? BLACKLIST.items : [];
         if (!items.length) {
           await interaction.reply({ content: 'ЧС пуст.', ephemeral: true });
           return;
@@ -446,7 +475,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        // unarchive if needed
         await ensureThreadActive(thread);
 
         const embed = new EmbedBuilder()
@@ -457,13 +485,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await thread.send({ embeds: [embed] }).catch(()=>{});
 
-        // --- Авто-выдача роли заявителю (если задано)
+        // Auto grant role (if configured)
         if (ACCEPT_ROLE_ID) {
           try {
-            // thread.ownerId содержит id автора треда при создании через форум
             const applicantId = thread.ownerId || null;
             if (applicantId && thread.guild) {
-              // fetch guild and member to ensure up-to-date info
               const guild = await thread.guild.fetch().catch(()=>null);
               const member = guild ? await guild.members.fetch(applicantId).catch(()=>null) : null;
               if (member) {
@@ -471,11 +497,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   console.warn('Grant role failed:', e?.message || e);
                 });
               } else {
-                // если участник не в гильдии — ничего не делаем
-                console.log('Applicant not found in guild to grant role:', applicantId);
+                // fallback: try find last message author
+                try {
+                  const fetched = await thread.fetch();
+                  const lastMsg = fetched?.messages?.cache?.first();
+                  const possibleAuthor = lastMsg?.author?.id;
+                  if (possibleAuthor && thread.guild) {
+                    const guild2 = await thread.guild.fetch().catch(()=>null);
+                    const member2 = guild2 ? await guild2.members.fetch(possibleAuthor).catch(()=>null) : null;
+                    if (member2) {
+                      await member2.roles.add(ACCEPT_ROLE_ID).catch(e => {
+                        console.warn('Grant role failed (fallback):', e?.message || e);
+                      });
+                    }
+                  }
+                } catch (e) {}
               }
             } else {
-              // если нет ownerId (например, создано не форумом) — можно дополнительно попытаться найти автора по последнему сообщению
+              // fallback attempt
               try {
                 const fetched = await thread.fetch();
                 const lastMsg = fetched?.messages?.cache?.first();
@@ -485,13 +524,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   const member2 = guild2 ? await guild2.members.fetch(possibleAuthor).catch(()=>null) : null;
                   if (member2) {
                     await member2.roles.add(ACCEPT_ROLE_ID).catch(e => {
-                      console.warn('Grant role failed (fallback):', e?.message || e);
+                      console.warn('Grant role failed (fallback2):', e?.message || e);
                     });
                   }
                 }
-              } catch (e) {
-                // fallback failed - ignore
-              }
+              } catch (e) {}
             }
           } catch (e) {
             console.warn('Auto-grant role error:', e?.message || e);
@@ -500,7 +537,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await thread.setArchived(true).catch(()=>{});
 
-        // log
         if (LEADERS_LOG_CHANNEL_ID) {
           const logCh = await client.channels.fetch(LEADERS_LOG_CHANNEL_ID).catch(()=>null);
           if (logCh && logCh.isTextBased()) {
@@ -576,7 +612,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const history = interaction.fields.getTextInputValue('history');
         const motivation = interaction.fields.getTextInputValue('motivation');
 
-        // validation
         const errors = [];
         if (yourName.length < 2) errors.push('Имя слишком короткое.');
         if (!discord.includes('#') && !discord.includes('@')) errors.push('Discord указан неверно.');
@@ -602,7 +637,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setFooter({ text: 'Заявка из формы' })
           .setTimestamp();
 
-        // send into forum channel as a thread (forum channel required)
         if (!APP_CHANNEL_ID) {
           await interaction.reply({ content: 'Ошибка: APP_CHANNEL_ID не задан.', ephemeral: true });
           return;
@@ -610,14 +644,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const forum = await client.channels.fetch(APP_CHANNEL_ID).catch(() => null);
         if (!forum || forum.type !== ChannelType.GuildForum) {
-          // try as normal text channel: send message and then start thread
           if (!forum || !forum.isTextBased()) {
             await interaction.reply({ content: 'Не удалось найти форум/канал заявок или бот не имеет прав.', ephemeral: true });
             return;
           }
         }
 
-        // Create thread in forum (forum.threads.create or forum.threads.start depending on type)
         try {
           const msgPayload = {
             content: ALLOWED_ROLE_IDS.length ? ALLOWED_ROLE_IDS.map(r => `<@&${r}>`).join(' ') : '',
@@ -630,18 +662,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ]
           };
 
-          // if forum channel - create a thread post
           if (forum.type === ChannelType.GuildForum) {
             const thread = await forum.threads.create({
               name: `Заявка — ${yourName}`,
               message: msgPayload
             });
-            // optionally ping roles in thread
             await interaction.reply({ content: 'Заявка отправлена!', ephemeral: true });
-            // thread created
             return;
           } else {
-            // normal text channel: send a message and start a thread
             const sent = await forum.send(msgPayload);
             if (sent?.startThread) {
               const thread = await sent.startThread({ name: `Заявка — ${yourName}` }).catch(()=>null);
@@ -696,17 +724,15 @@ const DISCORD_OAUTH_URL =
 async function requireAuth(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
   try {
-    // optional: verify membership
     if (GUILD_ID && global.oauthTokens[req.session.user.id]) {
       const token = global.oauthTokens[req.session.user.id];
       const r = await fetch(`https://discord.com/api/v10/users/@me/guilds/${GUILD_ID}/member`, {
         headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!r.ok) {
+      }).catch(()=>null);
+      if (!r || !r.ok) {
         return res.send('<h1>Вы не состоите на сервере или токен устарел.</h1>');
       }
       const member = await r.json();
-      // check roles
       const has = (member.roles || []).some(r => ALLOWED_ROLE_IDS.includes(r));
       if (!has) return res.send('<h1>У вас нет прав доступа к панели.</h1>');
     }
@@ -816,12 +842,10 @@ app.get('/api/thread/accept', requireAuth, async (req, res) => {
     await ensureThreadActive(thread);
     await thread.send({ embeds: [new EmbedBuilder().setTitle('✅ Заявка одобрена (WEB)').setDescription(`Лидер: <@${uid}>`).setColor(0x2ecc71)] }).catch(()=>{});
     await thread.setArchived(true).catch(()=>{});
-    // leaders log
     if (LEADERS_LOG_CHANNEL_ID) {
       const logCh = await client.channels.fetch(LEADERS_LOG_CHANNEL_ID).catch(()=>null);
       if (logCh && logCh.isTextBased()) logCh.send({ embeds: [new EmbedBuilder().setTitle('📗 Одобрение (WEB)').addFields({ name: 'Лидер', value: `<@${uid}>` }, { name: 'Thread', value: thread.name }).setColor(0x2ecc71)] }).catch(()=>{});
     }
-    // Auto-grant role for WEB accept (if configured)
     if (ACCEPT_ROLE_ID) {
       try {
         const applicantId = thread.ownerId || null;
@@ -872,10 +896,8 @@ app.get('/api/thread/deny', requireAuth, async (req, res) => {
 // ----------------------------- WEBHOOK: forms / zapier -> create application -----------------------------
 app.post('/webhook/form', async (req, res) => {
   try {
-    // ожидаем body: { name, discord, ic, motivation, type } type: family|restore|unblack (опционально)
     const { name, discord, ic, motivation, type = 'family' } = req.body || {};
 
-    // простая валидация
     if (!name || !discord || !ic || !motivation) {
       return res.status(400).json({ error: 'Missing fields. Required: name, discord, ic, motivation' });
     }
@@ -910,7 +932,6 @@ app.post('/webhook/form', async (req, res) => {
       ]
     };
 
-    // forum or text channel handling
     if (forum.type === ChannelType.GuildForum) {
       const thread = await forum.threads.create({
         name: `Заявка — ${name}`,
